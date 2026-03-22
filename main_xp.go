@@ -2,6 +2,7 @@ package main
 
 import (
 	"syscall"
+	"time"
 	"unsafe"
 )
 
@@ -10,54 +11,50 @@ var (
 	gdi32    = syscall.NewLazyDLL("gdi32.dll")
 	kernel32 = syscall.NewLazyDLL("kernel32.dll")
 
-	procRegisterClassEx  = user32.NewProc("RegisterClassExW")
-	procCreateWindowEx   = user32.NewProc("CreateWindowExW")
-	procDefWindowProc    = user32.NewProc("DefWindowProcW")
-	procBeginPaint       = user32.NewProc("BeginPaint")
-	procEndPaint         = user32.NewProc("EndPaint")
-	procInvalidateRect   = user32.NewProc("InvalidateRect")
-	procGetMessage       = user32.NewProc("GetMessageW")
-	procDispatchMessage  = user32.NewProc("DispatchMessageW")
-	procGetSystemMetrics = user32.NewProc("GetSystemMetrics")
-	procFillRect         = user32.NewProc("FillRect")
-	procCreateSolidBrush = gdi32.NewProc("CreateSolidBrush")
-	procDeleteObject     = gdi32.NewProc("DeleteObject")
-	procLoadCursor       = user32.NewProc("LoadCursorW")
-	procShowCursor       = user32.NewProc("ShowCursor")
-
-	colors = []uint32{0x0000FF, 0x00FF00, 0xFFFFFF, 0x000000, 0xFF0000, 0x00FFFF, 0xFF00FF}
-	idx    = 0
+	colors   = []uint32{0x0000FF, 0x00FF00, 0xFFFFFF, 0x000000, 0xFF0000, 0x00FFFF, 0xFF00FF}
+	idx      = 0
+	flashing = false
 )
-
-// WNDCLASSEXW 结构体定义，必须严格匹配 Windows API
-type WNDCLASSEXW struct {
-	Size       uint32
-	Style      uint32
-	WndProc    uintptr
-	ClsExtra   int32
-	WndExtra   int32
-	Instance   uintptr
-	Icon       uintptr
-	Cursor     uintptr
-	Background uintptr
-	MenuName   *uint16
-	ClassName  *uint16
-	IconSm     uintptr
-}
 
 func wndProc(hwnd uintptr, msg uint32, wp, lp uintptr) uintptr {
 	switch msg {
 	case 0x0001: // WM_CREATE
-		procShowCursor.Call(0)
-	case 0x0100, 0x0201: // 按键或左键
-		idx++
-		if idx >= len(colors) {
+		user32.NewProc("ShowCursor").Call(0)
+	case 0x0100: // WM_KEYDOWN
+		switch wp {
+		case 0x46: // F 键 - 开启/关闭闪烁
+			flashing = !flashing
+			if flashing {
+				user32.NewProc("SetTimer").Call(hwnd, 1, 30, 0)
+			} else {
+				user32.NewProc("KillTimer").Call(hwnd, 1)
+			}
+		case 0x27, 0x20, 0x0D: // Right, Space, Enter
+			idx++
+			if idx >= len(colors)+2 {
+				syscall.Exit(0)
+			}
+		case 0x25: // Left
+			idx--
+			if idx < 0 {
+				idx = 0
+			}
+		case 0x1B: // ESC
 			syscall.Exit(0)
 		}
-		procInvalidateRect.Call(hwnd, 0, 1)
-	case 0x0204, 0x0010: // 右键或关闭
-		procShowCursor.Call(1)
-		syscall.Exit(0)
+		user32.NewProc("InvalidateRect").Call(hwnd, 0, 1)
+	case 0x0113: // WM_TIMER
+		if flashing {
+			user32.NewProc("InvalidateRect").Call(hwnd, 0, 1)
+		}
+	case 0x0201: // Left Click
+		idx++
+		if idx >= len(colors)+2 {
+			syscall.Exit(0)
+		}
+		user32.NewProc("InvalidateRect").Call(hwnd, 0, 1)
+	case 0x0204:
+		syscall.Exit(0) // Right Click
 	case 0x000F: // WM_PAINT
 		var ps struct {
 			hdc    uintptr
@@ -65,49 +62,82 @@ func wndProc(hwnd uintptr, msg uint32, wp, lp uintptr) uintptr {
 			rc     [4]int32
 			res    [32]byte
 		}
-		hdc, _, _ := procBeginPaint.Call(hwnd, uintptr(unsafe.Pointer(&ps)))
-		w, _, _ := procGetSystemMetrics.Call(0)
-		h, _, _ := procGetSystemMetrics.Call(1)
-		rect := [4]int32{0, 0, int32(w), int32(h)}
-		brush, _, _ := procCreateSolidBrush.Call(uintptr(colors[idx]))
-		procFillRect.Call(hdc, uintptr(unsafe.Pointer(&rect)), brush)
-		procDeleteObject.Call(brush)
-		procEndPaint.Call(hwnd, uintptr(unsafe.Pointer(&ps)))
+		hdc, _, _ := user32.NewProc("BeginPaint").Call(hwnd, uintptr(unsafe.Pointer(&ps)))
+		w, _, _ := user32.NewProc("GetSystemMetrics").Call(0)
+		h, _, _ := user32.NewProc("GetSystemMetrics").Call(1)
+
+		if flashing {
+			// 闪烁模式：使用随机颜色
+			c := uint32(time.Now().UnixNano()) & 0xFFFFFF
+			brush, _, _ := gdi32.NewProc("CreateSolidBrush").Call(uintptr(c))
+			rect := [4]int32{0, 0, int32(w), int32(h)}
+			user32.NewProc("FillRect").Call(hdc, uintptr(unsafe.Pointer(&rect)), brush)
+			gdi32.NewProc("DeleteObject").Call(brush)
+		} else {
+			// 正常模式逻辑（同前）
+			if idx < len(colors) {
+				rect := [4]int32{0, 0, int32(w), int32(h)}
+				brush, _, _ := gdi32.NewProc("CreateSolidBrush").Call(uintptr(colors[idx]))
+				user32.NewProc("FillRect").Call(hdc, uintptr(unsafe.Pointer(&rect)), brush)
+				gdi32.NewProc("DeleteObject").Call(brush)
+			} else if idx == len(colors) { // 网格
+				for i := 0; i <= 20; i++ {
+					gdi32.NewProc("MoveToEx").Call(hdc, uintptr(i*int(w)/20), 0, 0)
+					gdi32.NewProc("LineTo").Call(hdc, uintptr(i*int(w)/20), uintptr(h))
+					gdi32.NewProc("MoveToEx").Call(hdc, 0, uintptr(i*int(h)/20), 0)
+					gdi32.NewProc("LineTo").Call(hdc, uintptr(w), uintptr(i*int(h)/20))
+				}
+			} else { // 渐变
+				for i := 0; i < 255; i++ {
+					r := [4]int32{int32(i * int(w) / 255), 0, int32((i + 1) * int(w) / 255), int32(h)}
+					c := uint32(i | (i << 8) | (i << 16))
+					brush, _, _ := gdi32.NewProc("CreateSolidBrush").Call(uintptr(c))
+					user32.NewProc("FillRect").Call(hdc, uintptr(unsafe.Pointer(&r)), brush)
+					gdi32.NewProc("DeleteObject").Call(brush)
+				}
+			}
+		}
+		user32.NewProc("EndPaint").Call(hwnd, uintptr(unsafe.Pointer(&ps)))
 		return 0
 	}
-	ret, _, _ := procDefWindowProc.Call(hwnd, uintptr(msg), wp, lp)
+	ret, _, _ := user32.NewProc("DefWindowProcW").Call(hwnd, uintptr(msg), wp, lp)
 	return ret
 }
 
 func main() {
+	// 进阶优化：开启 DPI 感知，防止 Win10 下模糊
+	shcore := syscall.NewLazyDLL("shcore.dll")
+	if shcore.Load() == nil {
+		// Process_Per_Monitor_DPI_Aware = 2
+		shcore.NewProc("SetProcessDpiAwareness").Call(2)
+	} else {
+		user32.NewProc("SetProcessDPIAware").Call()
+	}
+
 	inst, _, _ := kernel32.NewProc("GetModuleHandleW").Call(0)
-	clsName, _ := syscall.UTF16PtrFromString("XP_ST_CLS")
-	hCursor, _, _ := procLoadCursor.Call(0, 32512) // IDC_ARROW
+	cls, _ := syscall.UTF16PtrFromString("XP_ST_PRO")
+	cur, _, _ := user32.NewProc("LoadCursorW").Call(0, 32512)
 
-	var wc WNDCLASSEXW
-	wc.Size = uint32(unsafe.Sizeof(wc))
-	wc.Style = 0x0003 // CS_HREDRAW | CS_VREDRAW
-	wc.WndProc = syscall.NewCallback(wndProc)
-	wc.Instance = inst
-	wc.Cursor = hCursor
-	wc.ClassName = clsName
-
-	res, _, err := procRegisterClassEx.Call(uintptr(unsafe.Pointer(&wc)))
-	if res == 0 {
-		panic("RegisterClassExW failed: " + err.Error())
+	var wc struct {
+		cb              uint32
+		st              uint32
+		pr              uintptr
+		cl, wd          int32
+		ins, ic, cu, bg uintptr
+		mn, cn          *uint16
+		is              uintptr
 	}
+	wc.cb = uint32(unsafe.Sizeof(wc))
+	wc.pr = syscall.NewCallback(wndProc)
+	wc.ins = inst
+	wc.cu = cur
+	wc.cn = cls
+	user32.NewProc("RegisterClassExW").Call(uintptr(unsafe.Pointer(&wc)))
 
-	hwnd, _, err := procCreateWindowEx.Call(
-		0,
-		uintptr(unsafe.Pointer(clsName)),
-		uintptr(unsafe.Pointer(clsName)),
-		0x80000000|0x10000000, // WS_POPUP | WS_VISIBLE
-		0, 0, 1920, 1080,
-		0, 0, inst, 0,
-	)
-	if hwnd == 0 {
-		panic("CreateWindowExW failed: " + err.Error())
-	}
+	w, _, _ := user32.NewProc("GetSystemMetrics").Call(0)
+	h, _, _ := user32.NewProc("GetSystemMetrics").Call(1)
+
+	user32.NewProc("CreateWindowExW").Call(0, uintptr(unsafe.Pointer(cls)), 0, 0x80000000|0x10000000, 0, 0, w, h, 0, 0, inst, 0)
 
 	var m struct {
 		h    uintptr
@@ -117,10 +147,10 @@ func main() {
 		pt   struct{ x, y int32 }
 	}
 	for {
-		r, _, _ := procGetMessage.Call(uintptr(unsafe.Pointer(&m)), 0, 0, 0)
+		r, _, _ := user32.NewProc("GetMessageW").Call(uintptr(unsafe.Pointer(&m)), 0, 0, 0)
 		if r == 0 {
 			break
 		}
-		procDispatchMessage.Call(uintptr(unsafe.Pointer(&m)))
+		user32.NewProc("DispatchMessageW").Call(uintptr(unsafe.Pointer(&m)))
 	}
 }
